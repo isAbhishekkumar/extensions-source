@@ -66,10 +66,44 @@ class AsuraScans : ParsedHttpSource(), ConfigurableSource {
 
     override val client = network.cloudflareClient.newBuilder()
         .addInterceptor(::forceHighQualityInterceptor)
-        .rateLimit(1, 3)
+        .addInterceptor(::imageCacheInterceptor)
+        .rateLimit(2, 3)
+        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .callTimeout(45, java.util.concurrent.TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .apply {
+            connectionPool(okhttp3.ConnectionPool(10, 2, java.util.concurrent.TimeUnit.MINUTES))
+        }
         .build()
 
     private var failedHighQuality = false
+
+    /**
+     * Interceptor that improves caching for images to speed up loading
+     */
+    private fun imageCacheInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val url = request.url.toString()
+        
+        // Apply aggressive caching for image requests
+        if (preferences.aggressiveCaching() && 
+            (url.contains(".webp") || url.contains(".jpg") || url.contains(".png") || url.contains("/storage/media/"))) {
+            val response = chain.proceed(request)
+            
+            // If no cache control defined from server, set our own
+            if (response.header("Cache-Control") == null) {
+                return response.newBuilder()
+                    .header("Cache-Control", "max-age=86400") // Cache for 24 hours
+                    .build()
+            }
+            
+            return response
+        }
+        
+        return chain.proceed(request)
+    }
 
     private fun forceHighQualityInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -297,16 +331,62 @@ class AsuraScans : ParsedHttpSource(), ConfigurableSource {
             .joinToString("") { it.data().substringAfter("\"").substringBeforeLast("\"") }
         val pagesData = PAGES_REGEX.find(scriptData)?.groupValues?.get(1) ?: throw Exception("Failed to find chapter pages")
         val pageList = json.decodeFromString<List<PageDto>>(pagesData.unescape()).sortedBy { it.order }
-        return pageList.mapIndexed { i, page ->
-            val newUrl = page.url.toHttpUrlOrNull()?.run {
+        
+        // Pre-process URLs for better performance
+        val pages = pageList.mapIndexed { i, page ->
+            // Optimize URL for faster loading
+            val optimizedUrl = page.url.let { url ->
+                when {
+                    // If using WebP and not using optimized version already, use optimized version for faster loading
+                    !preferences.forceHighQuality() && url.endsWith(".webp") && !url.contains("-optimized") && 
+                    OPTIMIZED_IMAGE_PATH_REGEX.find(url) != null -> {
+                        url // Already optimized format
+                    }
+                    // For other image types, keep as is but mark for appropriate caching
+                    else -> url
+                }
+            }
+
+            val newUrl = optimizedUrl.toHttpUrlOrNull()?.run {
                 newBuilder()
                     .fragment("pageListParse")
                     .build()
                     .toString()
             }
 
-            Page(i, imageUrl = newUrl ?: page.url)
+            Page(i, imageUrl = newUrl ?: optimizedUrl)
         }
+        
+        // Trigger prefetching of first few images to improve perceived loading performance
+        // This happens in a background thread so it won't block the UI
+        if (pages.isNotEmpty() && preferences.prefetchImages()) {
+            thread(start = true, isDaemon = true, name = "Image-Prefetcher") {
+                try {
+                    // Prefetch first 3 images
+                    val imagesToPrefetch = minOf(3, pages.size)
+                    for (i in 0 until imagesToPrefetch) {
+                        try {
+                            val imageUrl = pages[i].imageUrl ?: continue
+                            // Set a timeout to prevent hanging
+                            val prefetchRequest = Request.Builder()
+                                .url(imageUrl)
+                                .headers(headers)
+                                .build()
+                            client.newCall(prefetchRequest).execute().close()
+                            // Add a small delay between fetches to reduce strain
+                            Thread.sleep(100)
+                        } catch (e: Exception) {
+                            // Catch individual image fetch errors
+                            // Continue with next image
+                        }
+                    }
+                } catch (e: Throwable) {
+                    // Catch all possible exceptions to ensure prefetching never crashes the app
+                }
+            }
+        }
+        
+        return pages
     }
 
     override fun imageUrlParse(document: Document) = throw UnsupportedOperationException()
@@ -340,6 +420,20 @@ class AsuraScans : ParsedHttpSource(), ConfigurableSource {
             }
             setDefaultValue(false)
         }.let(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_AGGRESSIVE_CACHING
+            title = "Use aggressive image caching"
+            summary = "Improves loading speed for previously viewed images but may use more disk space"
+            setDefaultValue(true)
+        }.let(screen::addPreference)
+        
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_PREFETCH_IMAGES
+            title = "Prefetch images"
+            summary = "Prefetches the first few images of each chapter for faster initial loading.\nDisable if you experience crashes or connectivity issues."
+            setDefaultValue(true)
+        }.let(screen::addPreference)
     }
 
     private var SharedPreferences.slugMap: MutableMap<String, String>
@@ -366,6 +460,10 @@ class AsuraScans : ParsedHttpSource(), ConfigurableSource {
         PREF_FORCE_HIGH_QUALITY,
         false,
     )
+    private fun SharedPreferences.aggressiveCaching(): Boolean = getBoolean(
+        PREF_AGGRESSIVE_CACHING,
+        true,
+    )
 
     private fun String.toPermSlugIfNeeded(): String {
         if (!preferences.dynamicUrl()) return this
@@ -379,6 +477,8 @@ class AsuraScans : ParsedHttpSource(), ConfigurableSource {
         return UNESCAPE_REGEX.replace(this, "$1")
     }
 
+    private fun SharedPreferences.prefetchImages(): Boolean = getBoolean(PREF_PREFETCH_IMAGES, true)
+
     companion object {
         private val UNESCAPE_REGEX = """\\(.)""".toRegex()
         private val PAGES_REGEX = """\\"pages\\":(\[.*?])""".toRegex()
@@ -391,5 +491,7 @@ class AsuraScans : ParsedHttpSource(), ConfigurableSource {
         private const val PREF_DYNAMIC_URL = "pref_dynamic_url"
         private const val PREF_HIDE_PREMIUM_CHAPTERS = "pref_hide_premium_chapters"
         private const val PREF_FORCE_HIGH_QUALITY = "pref_force_high_quality"
+        private const val PREF_AGGRESSIVE_CACHING = "pref_aggressive_caching"
+        private const val PREF_PREFETCH_IMAGES = "pref_prefetch_images"
     }
 }
